@@ -12,7 +12,8 @@
 #include <vector>
 #include <functional>
 #include <iostream>
-#include "ThreadPool/ThreadPool.h"
+#include "ThreadPool/ThreadWorkers.h"
+
 typedef signed char schar;
 template <class T> static inline void swap(T& x, T& y) { T t=x; x=y; y=t; }
 #ifndef min
@@ -51,51 +52,6 @@ static void info(const char *fmt,...)
 static void info(const char *fmt,...) {}
 #endif
 
-void run_workers(ThreadPool &thrd_pool, std::function<void(int)> func, int num_cpus) 
-{
-	std::mutex cv_m;
-	std::condition_variable cv;
-
-	int run_count = num_cpus;
-
-	for (int i = 0; i < num_cpus; ++i) {
-		thrd_pool.enqueue([i, func, &cv, &cv_m, &run_count] {
-			func(i);
-			{
-				std::unique_lock<std::mutex> grd(cv_m);
-				if (--run_count == 0)
-					cv.notify_one (); // wake the main thread
-			}
-		});
-	}
-
-	{
-		std::unique_lock<std::mutex> grd(cv_m);
-		cv.wait(grd, [&run_count] {return run_count == 0;}); // wait for notify
-	}
-
-	return;
-}
-
-static inline int parallel_start(int tid, int N, int C) 
-{
-	if (N >= C) {
-		return (tid * (N / C));
-	} else {
-		return (tid < N ? tid : 0);
-	}
-}
-
-static inline int parallel_end(int tid, int N, int C) 
-{
-
-	if (N >= C) {
-		return ((tid == C-1) ? N : ((tid + 1) * (N / C)));
-	} else {
-		return (tid < N ? (tid + 1) : 0);
-	}
-}
-
 class l2r_lr_fun: public function
 {
 public:
@@ -118,35 +74,8 @@ private:
 
 	const problem *prob;
 
-	int num_cpus;
 	double *local_store;
-	ThreadPool *thrd_pool;
-	void run_workers(std::function<void(int)> func, int num_cpus) 
-	{
-		std::mutex cv_m;
-		std::condition_variable cv;
-
-		int run_count = num_cpus;
-
-		for (int i = 0; i < num_cpus; ++i) {
-			thrd_pool->enqueue([i, func, &cv, &cv_m, &run_count] {
-				func(i);
-				{
-					std::unique_lock<std::mutex> grd(cv_m);
-					if (--run_count == 0)
-						cv.notify_one (); // wake the main thread
-				}
-			});
-		}
-
-		{
-			std::unique_lock<std::mutex> grd(cv_m);
-			cv.wait(grd, [&run_count] {return run_count == 0;}); // wait for notify
-		}
-
-		return;
-	}
-
+	ThreadWorkers *threads;
 };
 
 l2r_lr_fun::l2r_lr_fun(const problem *prob, double *C)
@@ -159,11 +88,12 @@ l2r_lr_fun::l2r_lr_fun(const problem *prob, double *C)
 	D = new double[l];
 	this->C = C;
 
-	num_cpus = std::thread::hardware_concurrency();
 	int w_size = get_nr_variable();
-	local_store = new double [w_size * num_cpus];
 
-	thrd_pool = new ThreadPool(num_cpus);
+	threads = ThreadWorkers::getInstance();
+	int num_cpus = threads->get_num_cpus();
+
+	local_store = new double [w_size * num_cpus];
 }
 
 l2r_lr_fun::~l2r_lr_fun()
@@ -172,7 +102,6 @@ l2r_lr_fun::~l2r_lr_fun()
 	delete[] D;
 
 	delete [] local_store;
-	delete thrd_pool;
 }
 
 
@@ -190,16 +119,16 @@ double l2r_lr_fun::fun(double *w)
 
 		double f = 0;
 
-		int start = parallel_start(tid, w_size, num_cpus);
-		int end = parallel_end(tid, w_size, num_cpus);
+		int start = threads->start(tid, w_size);
+		int end = threads->end(tid, w_size);
 
 		for(int i=start;i<end;i++)
 			f += w[i]*w[i];
 
 		f /= 2.0;
 
-		start = parallel_start(tid, l, num_cpus);
-		end = parallel_end(tid, l, num_cpus);
+		start = threads->start(tid, l);
+		end = threads->end(tid, l);
 
 		for(int i=start;i<end;i++)
 		{
@@ -216,7 +145,7 @@ double l2r_lr_fun::fun(double *w)
 		}
 	};
 
-	run_workers(func, num_cpus);
+	threads->run_workers(func);
 
 	return (total_f);
 }
@@ -229,8 +158,8 @@ void l2r_lr_fun::grad(double *w, double *g)
 
 	auto func1 = [&] (int tid) {
 
-		int start = parallel_start(tid, l, num_cpus); 
-		int end = parallel_end(tid, l, num_cpus);
+		int start = threads->start(tid, l); 
+		int end = threads->end(tid, l);
 
 		for(int i=start;i<end;i++)
 		{
@@ -240,20 +169,20 @@ void l2r_lr_fun::grad(double *w, double *g)
 		}
 	};
 
-	run_workers(func1, num_cpus);
+	threads->run_workers(func1);
 
 	XTv(z, g);
 
 	auto func2 = [&] (int tid) {
 
-		int start = parallel_start(tid, w_size, num_cpus);
-		int end = parallel_end(tid, w_size, num_cpus);
+		int start = threads->start(tid, w_size);
+		int end = threads->end(tid, w_size);
 
 		for(int i=start;i<end;i++)
 			g[i] = w[i] + g[i];
 	};
 
-	run_workers(func2, num_cpus);
+	threads->run_workers(func2);
 }
 
 int l2r_lr_fun::get_nr_variable(void)
@@ -271,27 +200,27 @@ void l2r_lr_fun::Hv(double *s, double *Hs)
 
 	auto func1 = [&] (int tid) {
 
-		int start = parallel_start(tid, l, num_cpus);
-		int end = parallel_end(tid, l, num_cpus);
+		int start = threads->start(tid, l);
+		int end = threads->end(tid, l);
 
 		for(int i=start;i<end;i++)
 			wa[i] = C[i]*D[i]*wa[i];
 	};
 
-	run_workers(func1, num_cpus);
+	threads->run_workers(func1);
 
 	XTv(wa, Hs);
 
 	auto func2 = [&] (int tid) {
 
-		int start = parallel_start(tid, w_size, num_cpus);
-		int end = parallel_end(tid, w_size, num_cpus);
+		int start = threads->start(tid, w_size);
+		int end = threads->end(tid, w_size);
 
 		for(int i=start;i<end;i++)
 			Hs[i] = s[i] + Hs[i];
 	};
 
-	run_workers(func2, num_cpus);
+	threads->run_workers(func2);
 
 	delete[] wa;
 }
@@ -303,8 +232,8 @@ void l2r_lr_fun::Xv(double *v, double *Xv)
 
 	auto func = [&](int tid) {
 
-		int start = parallel_start(tid, l, num_cpus);
-		int end = parallel_end(tid, l, num_cpus);
+		int start = threads->start(tid, l);
+		int end = threads->end(tid, l);
 
 		for(int i=start;i<end;i++)
 		{
@@ -318,7 +247,7 @@ void l2r_lr_fun::Xv(double *v, double *Xv)
 		}
 	};
 
-	run_workers(func, num_cpus);
+	threads->run_workers(func);
 }
 
 void l2r_lr_fun::XTv(double *v, double *XTv)
@@ -332,8 +261,8 @@ void l2r_lr_fun::XTv(double *v, double *XTv)
 	std::mutex lk;
 	auto func = [&] (int tid) {
 
-		int start = parallel_start(tid, l, num_cpus);
-		int end = parallel_end(tid, l, num_cpus);
+		int start = threads->start(tid, l);
+		int end = threads->end(tid, l);
 
 		double *tmp_XTv = & local_store[tid*w_size];
 		memset(tmp_XTv, 0, sizeof(double) * w_size);
@@ -356,7 +285,7 @@ void l2r_lr_fun::XTv(double *v, double *XTv)
 		}
 	};
 
-	run_workers(func, num_cpus);
+	threads->run_workers(func);
 }
 
 class l2r_l2_svc_fun: public function
@@ -384,35 +313,8 @@ protected:
 	const problem *prob;
 
 	int *local_sizeI;
-	int num_cpus;
 	double *local_store;
-	ThreadPool *thrd_pool;
-	void run_workers(std::function<void(int)> func, int num_cpus) 
-	{
-		std::mutex cv_m;
-		std::condition_variable cv;
-
-		int run_count = num_cpus;
-
-		for (int i = 0; i < num_cpus; ++i) {
-			thrd_pool->enqueue([i, func, &cv, &cv_m, &run_count] {
-				func(i);
-				{
-					std::unique_lock<std::mutex> grd(cv_m);
-					if (--run_count == 0)
-						cv.notify_one (); // wake the main thread
-				}
-			});
-		}
-
-		{
-			std::unique_lock<std::mutex> grd(cv_m);
-			cv.wait(grd, [&run_count] {return run_count == 0;}); // wait for notify
-		}
-
-		return;
-	}
-
+	ThreadWorkers *threads;
 };
 
 l2r_l2_svc_fun::l2r_l2_svc_fun(const problem *prob, double *C)
@@ -426,11 +328,11 @@ l2r_l2_svc_fun::l2r_l2_svc_fun(const problem *prob, double *C)
 	I = new int[l];
 	this->C = C;
 
-	num_cpus = std::thread::hardware_concurrency();
+	threads = ThreadWorkers::getInstance();
+	int num_cpus = threads->get_num_cpus();
 	int w_size = get_nr_variable();
 	local_store = new double [w_size * num_cpus];
 	local_sizeI = new int [num_cpus];
-	thrd_pool = new ThreadPool(num_cpus);
 }
 
 l2r_l2_svc_fun::~l2r_l2_svc_fun()
@@ -441,7 +343,6 @@ l2r_l2_svc_fun::~l2r_l2_svc_fun()
 
 	delete [] local_store;
 	delete [] local_sizeI;
-	delete thrd_pool;
 }
 
 double l2r_l2_svc_fun::fun(double *w)
@@ -458,15 +359,15 @@ double l2r_l2_svc_fun::fun(double *w)
 	
 		double f = 0;
 
-		int start = parallel_start(tid, w_size, num_cpus);
-		int end = parallel_end(tid, w_size, num_cpus);
+		int start = threads->start(tid, w_size);
+		int end = threads->end(tid, w_size);
 
 		for(int i=start;i<end;i++)
 			f += w[i]*w[i];
 		f /= 2.0;
 
-		start = parallel_start(tid, l, num_cpus);
-		end = parallel_end(tid, l, num_cpus);
+		start = threads->start(tid, l);
+		end = threads->end(tid, l);
 
 		for(int i=start;i<end;i++)
 		{
@@ -482,7 +383,7 @@ double l2r_l2_svc_fun::fun(double *w)
 		}
 	};
 
-	run_workers(func, num_cpus);
+	threads->run_workers(func);
 
 	return (total_f);
 }
@@ -497,8 +398,8 @@ void l2r_l2_svc_fun::grad(double *w, double *g)
 
 	auto func1 = [&] (int tid) {
 
-		int start = parallel_start(tid, l, num_cpus);
-		int end = parallel_end(tid, l, num_cpus);
+		int start = threads->start(tid, l);
+		int end = threads->end(tid, l);
 
 		int t_sizeI = start;
 
@@ -514,11 +415,12 @@ void l2r_l2_svc_fun::grad(double *w, double *g)
 		local_sizeI[tid] = t_sizeI;
 	};
 
-	run_workers(func1, num_cpus);
+	threads->run_workers(func1);
 
+	int num_cpus = threads->get_num_cpus();
 	sizeI = local_sizeI[0];
 	for (int tid = 1; tid < num_cpus; ++tid) {
-		int start = parallel_start(tid, l, num_cpus);
+		int start = threads->start(tid, l);
 		for (int j = start; j < local_sizeI[tid]; ++j) {
 			z[sizeI] = z[j];
 			I[sizeI] = I[j];
@@ -530,14 +432,14 @@ void l2r_l2_svc_fun::grad(double *w, double *g)
 
 	auto func2 = [&] (int tid) {
 
-		int start = parallel_start(tid, w_size, num_cpus);
-		int end = parallel_end(tid, w_size, num_cpus);
+		int start = threads->start(tid, w_size);
+		int end = threads->end(tid, w_size);
 
 		for(int i=start;i<end;i++)
 			g[i] = w[i] + 2*g[i];
 	};
 
-	run_workers(func2, num_cpus);
+	threads->run_workers(func2);
 }
 
 int l2r_l2_svc_fun::get_nr_variable(void)
@@ -554,28 +456,28 @@ void l2r_l2_svc_fun::Hv(double *s, double *Hs)
 
 	auto func1 = [&] (int tid) {
 
-		int start = parallel_start(tid, sizeI, num_cpus);
-		int end = parallel_end(tid, sizeI, num_cpus);
+		int start = threads->start(tid, sizeI);
+		int end = threads->end(tid, sizeI);
 
 		for(int i=start;i<end;i++)
 			wa[i] = C[I[i]]*wa[i];
 	};
 
-	run_workers(func1, num_cpus);
+	threads->run_workers(func1);
 
 
 	subXTv(wa, Hs);
 
 	auto func2 = [&] (int tid) {
 
-		int start = parallel_start(tid, w_size, num_cpus);
-		int end = parallel_end(tid, w_size, num_cpus);
+		int start = threads->start(tid, w_size);
+		int end = threads->end(tid, w_size);
 
 		for(int i=start;i<end;i++)
 			Hs[i] = s[i] + 2*Hs[i];
 	};
 
-	run_workers(func2, num_cpus);
+	threads->run_workers(func2);
 
 	delete[] wa;
 }
@@ -587,8 +489,8 @@ void l2r_l2_svc_fun::Xv(double *v, double *Xv)
 
 	auto func = [&] (int tid) {
 
-		int start = parallel_start(tid, l, num_cpus);
-		int end = parallel_end(tid, l, num_cpus);
+		int start = threads->start(tid, l);
+		int end = threads->end(tid, l);
 
 		for(int i=start;i<end;i++)
 		{
@@ -602,7 +504,7 @@ void l2r_l2_svc_fun::Xv(double *v, double *Xv)
 		}
 	};
 
-	run_workers(func, num_cpus);
+	threads->run_workers(func);
 }
 
 void l2r_l2_svc_fun::subXv(double *v, double *Xv)
@@ -611,8 +513,8 @@ void l2r_l2_svc_fun::subXv(double *v, double *Xv)
 
 	auto func = [&] (int tid) {
 
-		int start = parallel_start(tid, sizeI, num_cpus);
-		int end = parallel_end(tid, sizeI, num_cpus);
+		int start = threads->start(tid, sizeI);
+		int end = threads->end(tid, sizeI);
 	
 		for(int i=start;i<end;i++)
 		{
@@ -626,7 +528,7 @@ void l2r_l2_svc_fun::subXv(double *v, double *Xv)
 		}
 	};
 
-	run_workers(func, num_cpus);
+	threads->run_workers(func);
 }
 
 void l2r_l2_svc_fun::subXTv(double *v, double *XTv)
@@ -639,8 +541,8 @@ void l2r_l2_svc_fun::subXTv(double *v, double *XTv)
 	std::mutex lk;
 	auto func = [&] (int tid) {
 	
-		int start = parallel_start(tid, sizeI, num_cpus);	
-		int end = parallel_end(tid, sizeI, num_cpus);	
+		int start = threads->start(tid, sizeI);	
+		int end = threads->end(tid, sizeI);	
 
 		if (start < end) {
 
@@ -666,7 +568,7 @@ void l2r_l2_svc_fun::subXTv(double *v, double *XTv)
 		}
 	};
 
-	run_workers(func, num_cpus);
+	threads->run_workers(func);
 
 }
 
@@ -1158,11 +1060,13 @@ static void solve_l2r_l1l2_svc(
 		index[i] = i;
 	}
 
-	// !!! PARALLELIZE !!!
-	int num_cpus = std::thread::hardware_concurrency();
+	
+	// NEW: probability esitmate
+	ThreadWorkers *threads = ThreadWorkers::getInstance();
+	int num_cpus = threads->get_num_cpus();
+
 	double *tmpW = new double [w_size];
 	double *gW = new double [num_cpus * w_size];
-	ThreadPool thrd_pool(num_cpus);
 
 	while (iter < max_iter)
 	{
@@ -1175,7 +1079,7 @@ static void solve_l2r_l1l2_svc(
 			swap(index[i], index[j]);
 		}
 
-		// !!! PARALLELIZE !!!
+		// NEW: probability esitmate
 		std::list<int> removal_list;
 		std::mutex lk;
 		memset(tmpW, 0, sizeof(double) * w_size);
@@ -1188,13 +1092,8 @@ static void solve_l2r_l1l2_svc(
 			double *local_w = &gW[tid * w_size];
 			memcpy(local_w, w, sizeof(double) * w_size);
 
-			int start = tid * (active_size / num_cpus);
-			int end;
-			if (tid == num_cpus - 1) {
-				end = active_size;
-			} else {
-				end = (tid+1) * (active_size / num_cpus);
-			}
+			int start = threads->start(tid, active_size);
+			int end = threads->end(tid, active_size);
 
 			for (int s=start; s<end; s++)
 			{
@@ -1266,7 +1165,8 @@ static void solve_l2r_l1l2_svc(
 
 		};
 
-		run_workers(thrd_pool, func, num_cpus);
+		// NEW: probability esitmate
+		threads->run_workers(func);
 
 		for (int i = 0; i < w_size; ++i) {
 			w[i] = tmpW[i] / num_cpus;
@@ -1329,10 +1229,10 @@ static void solve_l2r_l1l2_svc(
 	delete [] y;
 	delete [] index;
 
+	// NEW: probability esitmate
 	delete [] tmpW;
 	delete [] gW;
 }
-
 
 // A coordinate descent algorithm for 
 // L1-loss and L2-loss epsilon-SVR dual problem
@@ -2725,7 +2625,6 @@ static void binary_svc_probability(
 		else
 		{
 			parameter subparam = *param; // get the parameters from the original problem
-			subparam.C=1.0;
 			subparam.probability=0;
 			subparam.nr_weight=2;
 			subparam.weight_label = Malloc(int,2);
@@ -2855,17 +2754,17 @@ model* train(const problem *prob, const parameter *param)
 
 				// NEW: probability estimate
 				double *probA=NULL,*probB=NULL;
-				if (param->probability)
-				{
-					probA=Malloc(double,1);
-					probB=Malloc(double,1);
-				}
 
 				// Probability estimate for nr_class == 2 only
 				if (param->probability && 
 						(param->solver_type == L2R_L2LOSS_SVC_DUAL || 
 						 param->solver_type == L2R_L2LOSS_SVC || 
-						 param->solver_type == L2R_L1LOSS_SVC_DUAL)) {
+						 param->solver_type == L2R_L1LOSS_SVC_DUAL || 
+						 param->solver_type == L2R_LR)) {
+
+					probA=Malloc(double,1);
+					probB=Malloc(double,1);
+
 					binary_svc_probability(&sub_prob,param,weighted_C[0], weighted_C[1], probA[0], probB[0]);
 				}
 
